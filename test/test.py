@@ -1,89 +1,131 @@
-# test/test.py
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, ClockCycles
+from cocotb.triggers import RisingEdge, Timer
 
 
-@cocotb.test()
-async def test_reset_and_increment(dut):
-    """After reset deasserts, counter should start at 0 and increment by 1 each cycle."""
-    # Drive default values
-    dut.ena.value    = 1
-    dut.ui_in.value  = 0
-    dut.uio_in.value = 0
-    dut.clk.value    = 0
-    dut.rst_n.value  = 0  # assert reset (active-low)
+# Opcodes (ui_in[2:0])
+OP_ADD = 0b000
+OP_OR  = 0b001
+OP_AND = 0b010
+OP_NOR = 0b011
+OP_SHL = 0b100
+OP_SHR = 0b101
+OP_SUB = 0b110
 
-    # Start clock: 10 ns period (100 MHz)
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
 
-    # Hold reset for a couple of cycles
-    await ClockCycles(dut.clk, 2)
-    dut.rst_n.value = 1  # deassert reset
-
-    await ClockCycles(dut.clk, 2)
+async def reset_dut(dut):
+    """Reset helper: drive rst_n low, then high."""
     dut.rst_n.value = 0
-
-    await RisingEdge(dut.clk)
+    dut.ena.value   = 0
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0
+    await Timer(20, units="ns")
     dut.rst_n.value = 1
-
-    # After deasserting reset, first observed value should be 0 on the very next cycle
+    dut.ena.value   = 1
     await RisingEdge(dut.clk)
-    val = int(dut.uo_out.value)
-    assert val == 0, f"Counter after reset should be 0, got {val}"
+    await RisingEdge(dut.clk)
 
-    # Now check it increments by 1 each cycle for a few cycles
-    prev = val
-    for i in range(1, 10):
-        await RisingEdge(dut.clk)
-        val = int(dut.uo_out.value)
-        expected = (prev + 1) & 0xFF
-        assert val == expected, f"Cycle {i}: expected {expected}, got {val}"
-        prev = val
+
+async def apply_and_check(dut, opcode, A, B, exp_y, exp_flag, desc=""):
+    """
+    Apply one operation and check result.
+
+    NOTE: func_sel is ui_in[2:0], so A's low 3 bits must equal opcode.
+    This test chooses A that already satisfies that.
+    """
+    assert (A & 0b111) == opcode, f"A={A:#04x} does not encode opcode {opcode:03b}"
+
+    dut.ui_in.value  = A
+    dut.uio_in.value = B
+
+    await RisingEdge(dut.clk)   # inputs sampled
+    await RisingEdge(dut.clk)   # outputs registered
+
+    got_y    = int(dut.uo_out.value)
+    got_flag = int(dut.uio_out.value & 0x1)  # bit 0
+
+    msg = f"{desc} (opcode={opcode:03b}, A=0x{A:02X}, B=0x{B:02X})"
+
+    assert got_y == (exp_y & 0xFF), (
+        f"Result mismatch: {msg}: got 0x{got_y:02X}, expected 0x{exp_y & 0xFF:02X}"
+    )
+    assert got_flag == (exp_flag & 0x1), (
+        f"Flag mismatch: {msg}: got {got_flag}, expected {exp_flag & 0x1}"
+    )
 
 
 @cocotb.test()
-async def test_load_wraparound(dut):
-    """Counter must wrap from 255 to 0."""
-    # Re-init defaults
-    dut.ena.value    = 0
-    dut.ui_in.value  = 0
-    dut.uio_in.value = 0
-    dut.clk.value    = 0
-    dut.rst_n.value  = 1
+async def test_basic_ops(dut):
+    """Sanity-check all ALU operations: ADD, SUB, OR, AND, NOR, SHL, SHR."""
 
-    # Start clock if not already running
+    # Create and start a 10 ns period clock on dut.clk
     cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
 
-    await ClockCycles(dut.clk, 2);
-    z_str = dut.uo_out.value.binstr  # e.g., 'ZZZZZZZZ'
-    assert set(z_str.lower()) == {"z"}, f"Expected high Z, got {z_str}"
-    dut.ena.value = 1
+    # Reset
+    await reset_dut(dut)
 
-    # Hold reset for a couple of cycles
-    await RisingEdge(dut.clk)
-    dut.ui_in.value = 0xFE
-    dut.uio_in.value = 1
+    # ---------------------- ADD tests (opcode 000) ---------------------------
+    # Choose A with low 3 bits = 000
+    A = 0b00101000  # 0x28
+    B = 0x05
+    exp = A + B
+    exp_flag = 1 if exp > 0xFF else 0
+    await apply_and_check(dut, OP_ADD, A, B, exp, exp_flag, "ADD 0x28 + 0x05")
 
-    await RisingEdge(dut.clk)
-    dut.uio_in.value = 0
-    dut.ui_in.value = 0
+    # ADD with carry out
+    A = 0b11111000  # 0xF8 (low 3 bits 000)
+    B = 0x20        # 32
+    exp = A + B
+    exp_flag = 1 if exp > 0xFF else 0
+    await apply_and_check(dut, OP_ADD, A, B, exp, exp_flag, "ADD carry case")
 
-    await RisingEdge(dut.clk)
-    val_load = int(dut.uo_out.value)
-    assert val_load == 0xFE, f"Expected 254, got {val_load}"
+    # ---------------------- SUB tests (opcode 110) ---------------------------
+    # Choose A with low 3 bits = 110
+    A = 0b00101110  # 0x2E
+    B = 0x04
+    tmp = (A - B) & 0x1FF
+    exp = tmp & 0xFF
+    exp_flag = (tmp >> 8) & 0x1  # borrow/flag from {flag, diff} = A - B
+    await apply_and_check(dut, OP_SUB, A, B, exp, exp_flag, "SUB 0x2E - 0x04")
 
-    # Next: 255
-    await RisingEdge(dut.clk)
-    val_255 = int(dut.uo_out.value)
-    assert val_255 == 255, f"Expected 255, got {val_255}"
+    # Underflow case
+    A = 0b00000110  # 0x06 (low 3 bits 110)
+    B = 0x20
+    tmp = (A - B) & 0x1FF
+    exp = tmp & 0xFF
+    exp_flag = (tmp >> 8) & 0x1
+    await apply_and_check(dut, OP_SUB, A, B, exp, exp_flag, "SUB underflow")
 
-    # Wrap to 0
-    await RisingEdge(dut.clk)
-    val_0 = int(dut.uo_out.value)
-    assert val_0 == 0, f"Expected wrap to 0, got {val_0}"
+    # ---------------------- OR tests (opcode 001) ----------------------------
+    A = 0b00101001  # 0x29, low 3 bits 001
+    B = 0b00001111  # 0x0F
+    exp = A | B
+    await apply_and_check(dut, OP_OR, A, B, exp, 0, "OR")
 
-    # And then 1
-    await RisingEdge(dut.clk)
-    val_1 = int(dut.uo_out.value)
-    assert val_1 == 1, f"Expected 1 after wrap, got {val_1}"
+    # ---------------------- AND tests (opcode 010) ---------------------------
+    A = 0b01010110  # 0x56, low 3 bits 110 (oops) -> adjust to 010:
+    A = (0x56 & 0xF8) | OP_AND  # force low 3 bits = 010
+    B = 0b00111100  # 0x3C
+    exp = A & B
+    await apply_and_check(dut, OP_AND, A, B, exp, 0, "AND")
+
+    # ---------------------- NOR tests (opcode 011) ---------------------------
+    A = (0x5A & 0xF8) | OP_NOR  # force low 3 bits = 011
+    B = 0x0F
+    exp = (~(A | B)) & 0xFF
+    await apply_and_check(dut, OP_NOR, A, B, exp, 0, "NOR")
+
+    # ---------------------- SHL tests (opcode 100) ---------------------------
+    # For shifts, B[2:0] is shift amount
+    A = (0x11 & 0xF8) | OP_SHL  # low 3 bits = 100
+    shamt = 2
+    B = shamt  # upper bits ignored
+    exp = (A << shamt) & 0xFF
+    await apply_and_check(dut, OP_SHL, A, B, exp, 0, "SHIFT LEFT by 2")
+
+    # ---------------------- SHR tests (opcode 101) ---------------------------
+    A = (0x88 & 0xF8) | OP_SHR  # low 3 bits = 101
+    shamt = 3
+    B = shamt
+    exp = (A >> shamt) & 0xFF
+    await apply_and_check(dut, OP_SHR, A, B, exp, 0, "SHIFT RIGHT by 3")
