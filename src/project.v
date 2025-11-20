@@ -1,42 +1,199 @@
-/*
- * Copyright (c) 2024 Your Name
- * SPDX-License-Identifier: Apache-2.0
- */
-
 `default_nettype none
 
-module tt_um_example (
-    input  wire [7:0] ui_in,    // Dedicated inputs
-    output wire [7:0] uo_out,   // Dedicated outputs
-    input  wire [7:0] uio_in,   // IOs: Input path
-    output wire [7:0] uio_out,  // IOs: Output path
-    output wire [7:0] uio_oe,   // IOs: Enable path (active high: 0=input, 1=output)
-    input  wire       ena,      // always 1 when the design is powered, so you can ignore it
-    input  wire       clk,      // clock
-    input  wire       rst_n     // reset_n - low to reset
+// ---------------------------------------------------------------------------
+// 8-bit adder: used for ADD operation
+// ---------------------------------------------------------------------------
+module adder8 (
+    input  wire [7:0] a,
+    input  wire [7:0] b,
+    output wire [7:0] sum,
+    output wire       cout
 );
-  //sets reg
-  reg [7:0] counter;
+    assign {cout, sum} = a + b;
+endmodule
 
-  wire load = uio_in[0];
-  wire [7:0]dat = ui_in;
+// ---------------------------------------------------------------------------
+// 8-bit logic unit: OR, AND, NOR
+// sel encoding (matches func_sel[1:0] for opcodes 001,010,011):
+//   2'b01 : OR
+//   2'b10 : AND
+//   2'b11 : NOR
+//   2'b00 : (unused → 0)
+// ---------------------------------------------------------------------------
+module logic_unit8 (
+    input  wire [7:0] a,
+    input  wire [7:0] b,
+    input  wire [1:0] sel,
+    output reg  [7:0] y
+);
+    always @* begin
+        case (sel)
+            2'b01: y = a | b;         // OR
+            2'b10: y = a & b;         // AND
+            2'b11: y = ~(a | b);      // NOR
+            default: y = 8'h00;       // unused / safe default
+        endcase
+    end
+endmodule
 
-  // All output pins must be assigned. If not used, assign to 0.
-  //assign uo_out  = ui_in + uio_in;  // Example: ou_out is the sum of ui_in and uio_in
-  always @(posedge clk or negedge rst_n) begin
-    if (!rst_n)
-      counter <= 8'd0;
-    else if (load && ena)
-      counter <= dat;
-    else if (ena)
-      counter <= counter + 8'b1;
-  end
+// ---------------------------------------------------------------------------
+// 8-bit logical shifter
+// dir = 0 → shift left
+// dir = 1 → shift right
+// ---------------------------------------------------------------------------
+module shifter8 (
+    input  wire [7:0] a,
+    input  wire [2:0] shamt,
+    input  wire       dir,      // 0 = left, 1 = right
+    output wire [7:0] y
+);
+    assign y = dir ? (a >> shamt) : (a << shamt);
+endmodule
 
-  assign uo_out  = ena ? counter : 8'bZ;
-  assign uio_out = 8'bZ;
-  assign uio_oe  = 8'bZ;
+// ---------------------------------------------------------------------------
+// Top-level ALU for TinyTapeout-style interface
+//
+//  Pins:
+//    ui_in[7:0]  : A + function select in lower bits
+//    uio_in[7:0] : B / shift amount (lower bits)
+//    uo_out[7:0] : result (registered)
+//    uio_out[0]  : flag/carry (registered), rest 0
+//    uio_oe[0]   : 1 (drive flag), others 0
+//
+//  Function select (from ui_in[2:0]):
+//    000 : ADD          (A + B)              [adder8]
+//    001 : OR           (A | B)              [logic_unit8]
+//    010 : AND          (A & B)              [logic_unit8]
+//    011 : NOR          ~(A | B)             [logic_unit8]
+//    100 : SHIFT LEFT   (A << shamt)         [shifter8, dir=0]
+//    101 : SHIFT RIGHT  (A >> shamt)         [shifter8, dir=1]
+//    110 : SUBTRACT     (A - B)              new
+//    111 : reserved → 0
+//
+//  A     = ui_in[7:0]
+//  B     = uio_in[7:0]
+//  shamt = uio_in[2:0]
+// ---------------------------------------------------------------------------
+module tt_com_reg (
+    input  wire [7:0] ui_in,
+    output wire [7:0] uo_out,
+    input  wire [7:0] uio_in,
+    output wire [7:0] uio_out,
+    output wire [7:0] uio_oe,
+    input  wire       ena,
+    input  wire       clk,
+    input  wire       rst_n
+);
 
-  // List all unused inputs to prevent warnings
-    wire _unused = &{ena, clk, rst_n, uio_in, 1'b0};
+    // Decode function select
+    wire [2:0] func_sel = ui_in[2:0];
+
+    wire [7:0] A = ui_in;
+    wire [7:0] B = uio_in;
+    wire [2:0] shamt = uio_in[2:0];
+
+    // ---------------------- Submodule outputs -------------------------------
+    // ADD
+    wire [7:0] add_sum;
+    wire       add_cout;
+
+    adder8 u_adder8 (
+        .a   (A),
+        .b   (B),
+        .sum (add_sum),
+        .cout(add_cout)
+    );
+
+    // Logic (OR/AND/NOR)
+    wire [7:0] logic_y;
+    logic_unit8 u_logic8 (
+        .a   (A),
+        .b   (B),
+        .sel (func_sel[1:0]),   // 00=OR, 01=AND, 10=NOR
+        .y   (logic_y)
+    );
+
+    // Shifter
+    wire [7:0] shift_y;
+    wire       shift_dir = (func_sel == 3'b101) ? 1'b1 : 1'b0; // 100→left, 101→right
+
+    shifter8 u_shifter8 (
+        .a     (A),
+        .shamt (shamt),
+        .dir   (shift_dir),
+        .y     (shift_y)
+    );
+
+    // SUBTRACT: A - B
+    wire [7:0] sub_diff;
+    wire       sub_flag;    // treat as borrow/flag bit
+    assign {sub_flag, sub_diff} = A - B;
+
+    // ---------------------- Operation select mux ----------------------------
+    reg [7:0] alu_y;
+    reg       alu_flag;  // use as carry/flag output
+
+    always @* begin
+        case (func_sel)
+            3'b000: begin
+                // ADD
+                alu_y    = add_sum;
+                alu_flag = add_cout;       // carry
+            end
+
+            3'b001,
+            3'b010,
+            3'b011: begin
+                // logic ops: OR, AND, NOR
+                alu_y    = logic_y;
+                alu_flag = 1'b0;
+            end
+
+            3'b100: begin
+                // shift left
+                alu_y    = shift_y;
+                alu_flag = 1'b0;
+            end
+
+            3'b101: begin
+                // shift right
+                alu_y    = shift_y;
+                alu_flag = 1'b0;
+            end
+
+            3'b110: begin
+                // SUBTRACT: A - B
+                alu_y    = sub_diff;
+                alu_flag = sub_flag;       // borrow/flag
+            end
+
+            default: begin
+                alu_y    = 8'h00;
+                alu_flag = 1'b0;
+            end
+        endcase
+    end
+
+    // ----------------------------- Registers --------------------------------
+    reg [7:0] y_q;
+    reg       flag_q;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            y_q    <= 8'h00;
+            flag_q <= 1'b0;
+        end else if (ena) begin
+            y_q    <= alu_y;
+            flag_q <= alu_flag;
+        end
+        // if ena == 0, hold previous values
+    end
+
+    // Outputs
+    assign uo_out  = y_q;
+    assign uio_out = {7'b0, flag_q};
+    assign uio_oe  = 8'b0000_0001;   // only bit 0 drives
 
 endmodule
+
+`default_nettype wire
