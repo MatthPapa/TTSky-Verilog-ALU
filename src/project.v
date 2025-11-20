@@ -74,7 +74,7 @@ endmodule
 //  B     = uio_in[7:0]
 //  shamt = uio_in[2:0]
 // ---------------------------------------------------------------------------
-module tt_com_reg (
+module tt_um_reg (
     input  wire [7:0] ui_in,
     output wire [7:0] uo_out,
     input  wire [7:0] uio_in,
